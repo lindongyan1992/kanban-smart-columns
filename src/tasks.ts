@@ -171,11 +171,23 @@ export function cardText(raw: string, opts: CardTextOpts = {}): string {
  * 借助 Obsidian 的元数据缓存（listItems）只读取真正包含任务的文件，
  * 再用 cachedRead 取正文，避免在无关文件上做全量 IO。
  */
-export async function scanTasks(app: App): Promise<ScannedTask[]> {
+export async function scanTasks(
+  app: App,
+  excludePaths: string[] = []
+): Promise<ScannedTask[]> {
   const result: ScannedTask[] = [];
   const files = app.vault.getMarkdownFiles();
+  // 规范化排除项：去前导斜杠、反斜杠转正斜杠、去尾部斜杠，过滤空项。
+  // 这样用户填「文件夹带/不带尾部/」或「笔记完整路径」都能正确匹配。
+  const excludes = excludePaths
+    .map((p) => p.replace(/^\/+/, "").replace(/\\/g, "/").replace(/\/+$/, ""))
+    .filter((p) => p.length > 0);
 
   for (const file of files) {
+    // 排除指定文件夹（含子文件夹）或笔记中的任务：
+    // 精确匹配笔记路径，或以「路径/」前缀匹配文件夹内所有文件。
+    if (excludes.some((e) => file.path === e || file.path.startsWith(e + "/")))
+      continue;
     const cache = app.metadataCache.getFileCache(file);
     const items = cache?.listItems;
     if (!items || !items.some((i) => i.task !== undefined)) continue;

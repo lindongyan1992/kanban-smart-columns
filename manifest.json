@@ -1,7 +1,7 @@
 {
 	"id": "kanban-smart-columns",
 	"name": "Smart tasks-kanban",
-	"version": "0.6.4",
+	"version": "0.6.5",
 	"minAppVersion": "1.4.0",
 	"description": "Works together with the Kanban and Tasks plugins, automatically filtering tasks across the vault into the columns you specify on a board, and letting you mark a task as - [x] simply by dragging it into your done column.",
 	"author": "lindongyan1992",

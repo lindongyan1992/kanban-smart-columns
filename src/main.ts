@@ -97,6 +97,7 @@ interface SmartColumnsSettings {
   archiveEnabled: boolean;
   debugMode: boolean;
   language: Lang;
+  excludePaths: string[];
 }
 
 const DEFAULT_SETTINGS: SmartColumnsSettings = {
@@ -115,6 +116,7 @@ const DEFAULT_SETTINGS: SmartColumnsSettings = {
   archiveEnabled: true,
   debugMode: false,
   language: "zh",
+  excludePaths: [],
 };
 
 /**
@@ -143,6 +145,7 @@ interface I18nText {
     sync: string;
     refresh: string;
     debug: string;
+    scope: string;
   };
   settings: {
     autoRefresh: { name: string; desc: string };
@@ -159,6 +162,7 @@ interface I18nText {
     recurring: { name: string; desc: string };
     archiveEnabled: { name: string; desc: string };
     debugMode: { name: string; desc: string };
+    excludePaths: { name: string; desc: string };
   };
 }
 
@@ -252,6 +256,7 @@ const I18N: Record<Lang, I18nText> = {
     ].join("\n"),
     categories: {
       card: "卡片显示",
+      scope: "扫描范围",
       sync: "完成与同步",
       refresh: "刷新",
       debug: "问题排查",
@@ -317,6 +322,11 @@ const I18N: Record<Lang, I18nText> = {
         name: "调试模式",
         desc:
           "将刷新与看板同步过程写入 diag.txt，用于排查问题；排查完请关闭（关闭时不做任何磁盘写入）",
+      },
+      excludePaths: {
+        name: "排除路径",
+        desc:
+          "每行一个，排除指定文件夹或笔记中的未完成任务。文件夹以 / 结尾（如 40资料/01原始资料/），笔记写完整路径（如 40资料/某笔记.md）",
       },
     },
   },
@@ -409,6 +419,7 @@ const I18N: Record<Lang, I18nText> = {
     ].join("\n"),
     categories: {
       card: "Card display",
+      scope: "Scan scope",
       sync: "Completion & sync",
       refresh: "Refresh",
       debug: "Troubleshooting",
@@ -474,6 +485,11 @@ const I18N: Record<Lang, I18nText> = {
         name: "Debug mode",
         desc:
           "Write the plugin's refresh and board-sync steps to diag.txt for troubleshooting; turn off when done (while off, nothing is written)",
+      },
+      excludePaths: {
+        name: "Excluded paths",
+        desc:
+          "One per line. Exclude unfinished tasks from these folders or notes. Folder ends with / (e.g. 40资料/01原始资料/); note uses full path (e.g. 40资料/某笔记.md)",
       },
     },
   },
@@ -689,7 +705,8 @@ export default class KanbanSmartColumns extends Plugin {
         file,
         defs,
         this.settings.showSourceLink,
-        opts
+        opts,
+        this.settings.excludePaths
       );
       // 归档：把完成列中非当天完成的卡片移到归档列（受开关控制）
       if (this.settings.archiveEnabled) {
@@ -1175,6 +1192,23 @@ class SettingsTab extends PluginSettingTab {
         this.plugin.settings.showRecurring = v;
       }
     );
+
+    // ---- 扫描范围 ----
+    cat(T.categories.scope);
+    new Setting(containerEl)
+      .setName(T.settings.excludePaths.name)
+      .setDesc(T.settings.excludePaths.desc)
+      .addTextArea((t) => {
+        t.inputEl.addClass("kanban-smart-columns-exclude");
+        t.setValue(this.plugin.settings.excludePaths.join("\n"));
+        t.onChange(async (v) => {
+          this.plugin.settings.excludePaths = v
+            .split("\n")
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0);
+          await this.plugin.saveSettings();
+        });
+      });
 
     // ---- 完成与同步 ----
     cat(T.categories.sync);

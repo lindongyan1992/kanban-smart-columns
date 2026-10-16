@@ -114,3 +114,12 @@
 .settings-category:first-of-type {
   margin-top: 0.6em;
 }
+
+/* 设置页「排除路径」多行文本框：占满控制区宽度，便于粘贴多个路径 */
+.kanban-smart-columns-exclude {
+  width: 100%;
+  min-height: 96px;
+  resize: vertical;
+  font-family: var(--font-monospace);
+  line-height: 1.5;
+}

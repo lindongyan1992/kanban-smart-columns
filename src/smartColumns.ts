@@ -260,10 +260,11 @@ export async function applySmartColumns(
   file: TFile,
   defs: SmartColumnDef[],
   showLink: boolean,
-  opts: CardTextOpts
+  opts: CardTextOpts,
+  excludePaths: string[] = []
 ): Promise<boolean> {
   const today = todayISO();
-  const tasks = await scanTasks(app);
+  const tasks = await scanTasks(app, excludePaths);
   const content = await app.vault.read(file);
   let newContent = content;
   for (const def of defs) {
