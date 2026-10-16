@@ -1,0 +1,116 @@
+/* ============================================================
+ * Kanban Smart Columns — 样式覆盖
+ * ============================================================ */
+
+/* 修复：Kanban 列水平折叠（collapse-horizontal）时，列标题文字被旋转 180°
+ * 导致上下颠倒（"倒着"）。折叠时 header 已由 writing-mode: vertical-lr
+ * 竖排，无需再旋转，去掉 180° 即可正常竖排可读。
+ * 选择器与 obsidian-kanban/styles.css 中对应规则完全一致，并加 !important
+ * 以确保覆盖其样式（插件 CSS 加载顺序不固定）。 */
+.kanban-plugin__lane-wrapper.collapse-horizontal
+  .kanban-plugin__lane-title-count,
+.kanban-plugin__lane-wrapper.collapse-horizontal
+  .kanban-plugin__lane-title-text {
+  transform: none !important;
+}
+
+/* 设置页顶部的「使用方法」说明块：加边框与内边距，和下方选项区分开 */
+.kanban-smart-columns-guide {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  padding: 4px 14px 10px;
+  margin-bottom: 18px;
+  max-height: 240px;
+  overflow-y: auto;
+  font-size: var(--font-ui-small);
+  line-height: 1.6;
+}
+
+/* 说明块内的标题与间距收紧，避免占用过多设置页空间 */
+.kanban-smart-columns-guide h2 {
+  font-size: 1.15em;
+  margin: 12px 0 6px;
+}
+
+.kanban-smart-columns-guide h3 {
+  font-size: 1.02em;
+  margin: 12px 0 4px;
+}
+
+.kanban-smart-columns-guide h2:first-child {
+  margin-top: 6px;
+}
+
+.kanban-smart-columns-guide p {
+  margin: 4px 0;
+}
+
+.kanban-smart-columns-guide ul,
+.kanban-smart-columns-guide ol {
+  margin: 4px 0;
+  padding-left: 1.4em;
+}
+
+.kanban-smart-columns-guide li {
+  margin: 2px 0;
+}
+
+.kanban-smart-columns-guide pre {
+  margin: 6px 0;
+  font-size: 0.95em;
+}
+
+/* 表格上方的分组标题（如「到期日类」「优先级类」） */
+.kanban-smart-columns-guide .guide-table-title {
+  font-weight: 600;
+  margin: 10px 0 4px;
+}
+
+/* 表格：自带边框 / 表头底色 / 斑马纹，不依赖主题是否提供 .markdown-rendered 表格样式 */
+.kanban-smart-columns-guide table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 6px 0 12px;
+  font-size: 0.95em;
+}
+
+.kanban-smart-columns-guide table th,
+.kanban-smart-columns-guide table td {
+  border: 1px solid var(--background-modifier-border);
+  padding: 5px 9px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.kanban-smart-columns-guide table th {
+  background-color: var(--background-modifier-hover);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.kanban-smart-columns-guide table tbody tr:nth-child(even) td {
+  background-color: var(--background-secondary);
+}
+
+/* 表格内联的 source 取值（反引号代码）不换行，避免列宽被撑爆 */
+.kanban-smart-columns-guide table td:first-child code {
+  white-space: nowrap;
+}
+
+.kanban-smart-columns-guide blockquote {
+  margin: 8px 0 0;
+  font-size: 0.95em;
+}
+
+/* 设置页分类标题（卡片显示 / 完成与同步 / 刷新 / 问题排查） */
+.settings-category {
+  font-size: var(--font-ui-small);
+  font-weight: 600;
+  color: var(--text-normal);
+  margin: 1.4em 0 0.2em 0;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.settings-category:first-of-type {
+  margin-top: 0.6em;
+}
