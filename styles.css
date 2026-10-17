@@ -102,19 +102,6 @@
   font-size: 0.95em;
 }
 
-/* 设置页分类标题（卡片显示 / 完成与同步 / 刷新 / 问题排查） */
-.settings-category {
-  font-size: var(--font-ui-small);
-  font-weight: 600;
-  color: var(--text-normal);
-  margin: 1.4em 0 0.2em 0;
-  padding-bottom: 0.3em;
-  border-bottom: 1px solid var(--background-modifier-border);
-}
-.settings-category:first-of-type {
-  margin-top: 0.6em;
-}
-
 /* 设置页「排除路径」多行文本框：占满控制区宽度，便于粘贴多个路径 */
 .kanban-smart-columns-exclude {
   width: 100%;

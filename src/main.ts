@@ -67,7 +67,7 @@ export function diag(msg: string) {
     .then(async () => {
       let prev = "";
       try {
-        prev = (await ad.read(DIAG_PATH)) as string;
+        prev = await ad.read(DIAG_PATH);
       } catch {
         prev = "";
       }
@@ -1061,7 +1061,7 @@ class SettingsTab extends PluginSettingTab {
 
     const T = I18N[this.plugin.settings.language];
 
-    containerEl.createEl("h3", { text: T.settingsTitle });
+    new Setting(containerEl).setName(T.settingsTitle).setHeading();
 
     // 语言切换：改完即重渲染整页，使下方所有文案即时切换到所选语言
     new Setting(containerEl)
@@ -1084,7 +1084,7 @@ class SettingsTab extends PluginSettingTab {
     const guide = containerEl.createEl("div", {
       cls: "kanban-smart-columns-guide markdown-rendered",
     });
-    MarkdownRenderer.renderMarkdown(T.guideHead, guide, "", this.plugin);
+    void MarkdownRenderer.renderMarkdown(T.guideHead, guide, "", this.plugin);
 
     // source 取值表：手动构建 HTML 表格（不依赖 markdown 表格语法是否被解析）
     for (const group of T.sourceGroups) {
@@ -1102,14 +1102,11 @@ class SettingsTab extends PluginSettingTab {
       }
     }
 
-    MarkdownRenderer.renderMarkdown(T.guideTail, guide, "", this.plugin);
+    void MarkdownRenderer.renderMarkdown(T.guideTail, guide, "", this.plugin);
 
-    // 分类标题：把设置项分组，让设置页更有条理
+    // 分类标题：把设置项分组，让设置页更有条理（用 Obsidian 原生 setHeading 而非手写 h4，满足社区审核规范）
     const cat = (title: string) =>
-      containerEl.createEl("h4", {
-        text: title,
-        cls: "settings-category",
-      });
+      new Setting(containerEl).setName(title).setHeading();
 
     // 布尔开关行：统一「读取当前值 → 改动 → 落盘」的写法
     const boolToggle = (
