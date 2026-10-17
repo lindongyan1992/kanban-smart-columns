@@ -132,7 +132,6 @@ interface SourceGroup {
  * 内含 backtick 的代码片段以双引号字符串承载，英文里出现的双引号用 \" 转义。
  */
 interface I18nText {
-  settingsTitle: string;
   languageName: string;
   languageDesc: string;
   guideHead: string;
@@ -168,7 +167,6 @@ interface I18nText {
 
 const I18N: Record<Lang, I18nText> = {
   zh: {
-    settingsTitle: "Smart tasks-kanban 设置",
     languageName: "界面语言",
     languageDesc: "设置页面显示语言（中文 / English）",
     guideHead: [
@@ -331,7 +329,6 @@ const I18N: Record<Lang, I18nText> = {
     },
   },
   en: {
-    settingsTitle: "Smart tasks-kanban Settings",
     languageName: "Interface language",
     languageDesc: "Display language of this settings page (中文 / English)",
     guideHead: [
@@ -1060,8 +1057,6 @@ class SettingsTab extends PluginSettingTab {
     containerEl.empty();
 
     const T = I18N[this.plugin.settings.language];
-
-    new Setting(containerEl).setName(T.settingsTitle).setHeading();
 
     // 语言切换：改完即重渲染整页，使下方所有文案即时切换到所选语言
     new Setting(containerEl)
