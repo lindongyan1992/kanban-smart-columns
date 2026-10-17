@@ -528,6 +528,16 @@ export default class KanbanSmartColumns extends Plugin {
   private writeQueue: Promise<void> = Promise.resolve();
   // 每个看板文件「我们上次推送给视图的内容」，用于视图同步的判重（见 syncKanbanView）
   private lastPushed: Map<string, string> = new Map();
+  // 刷新串行队列：refreshFile 会被多个事件源并发触发（file-open 去抖、modify 去抖、
+  // 定时 refreshAll、设置变更去抖、手动命令）。旧实现无互斥，且 processing=true 只覆盖
+  // 写盘阶段——syncKanbanView 里的 await newBoard(...)（kanban prerender 异步渲染全部
+  // 卡片，数百毫秒）期间 processing 已复位为 false，写盘触发的 modify（去抖 1s 后到）
+  // 会穿透保护、并发跑第二轮刷新：它先清掉 previewCache，再为同一批卡片各创建一个
+  // preview widget，两轮的 widget 都挂到卡片 DOM 上 → 「同一张卡片文本重复两遍」的
+  // 偶发 bug（markdown 视图正常，切走再切回视图重建 DOM 后恢复正常）。
+  // 故把整个刷新流程（含视图推送）串行化：同一时刻只有一轮在跑，后续请求排队；
+  // 同时 processing 覆盖到推送完成，堵住 modify 事件穿透窗口。
+  private refreshQueue: Promise<void> = Promise.resolve();
 
   /**
    * 由设置项构造「卡片保留开关」对象，贯穿建卡 / 回写 / 撤销 / 归档整条链路。
@@ -581,10 +591,13 @@ export default class KanbanSmartColumns extends Plugin {
       })
     );
 
-    // 看板文件被修改（含用户在看板里勾选卡片）时：先回写完成，再刷新
+    // 看板文件被修改（含用户在看板里勾选卡片）时：先回写完成，再刷新。
+    // ⚠ 不再因 processing 直接丢弃：刷新全程（含视图推送的异步窗口）都持有 processing，
+    // 若在此丢弃，用户恰好在刷新期间勾选/拖动卡片的操作会丢失。onModify 各步均为幂等
+    // 设计（快照比对无 diff 则不动、完成列 [x] 不会重复处理、智能列卡片恒为 [ ]），
+    // 插件自写盘触发的 modify 最多多跑一轮空刷新后自然收敛，不会形成回环。
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
-        if (this.processing) return;
         if (file instanceof TFile && isKanbanFile(this.app, file)) {
           this.debouncedModify(file);
         }
@@ -683,10 +696,24 @@ export default class KanbanSmartColumns extends Plugin {
    */
   private async refreshAfterUndo(file: TFile, sources: TFile[]): Promise<void> {
     await awaitCacheForFiles(this.app, sources);
-    if (!this.processing) await this.refreshFile(file);
+    // 刷新已入串行队列（refreshQueue），无需再看 processing：它为 true 只表示
+    // 队列当前在跑别的任务，本请求排队等轮即可；条件跳过反而会漏掉这次刷新，
+    // 导致「撤销后任务没有立即重现于智能列」。
+    await this.refreshFile(file);
   }
 
-  private async refreshFile(file: TFile) {
+  /**
+   * 刷新入口：把实际刷新任务排入串行队列（见 refreshQueue 注释），避免多事件源
+   * 并发交错导致卡片重复渲染。返回队列尾部 Promise，调用方 await 即等本轮（及
+   * 之前排队的）刷新全部完成。
+   */
+  private refreshFile(file: TFile): Promise<void> {
+    const run = () => this.doRefreshFile(file);
+    this.refreshQueue = this.refreshQueue.then(run, run);
+    return this.refreshQueue;
+  }
+
+  private async doRefreshFile(file: TFile) {
     const defs = getSmartColumns(this.app, file);
     if (defs.length === 0) return;
     diag(
@@ -694,6 +721,9 @@ export default class KanbanSmartColumns extends Plugin {
         this.cardOpts()
       )}`
     );
+    // processing 覆盖全程（写盘 + 视图推送）：syncKanbanView 的 await newBoard
+    // 期间也应挡住 modify 事件，防止第二轮刷新在 prerender 异步窗口内交错
+    // （这是「卡片文本重复两遍」偶发 bug 的根因，见 refreshQueue 注释）。
     this.processing = true;
     try {
       const opts = this.cardOpts();
@@ -709,21 +739,21 @@ export default class KanbanSmartColumns extends Plugin {
       if (this.settings.archiveEnabled) {
         await archiveOldDone(this.app, file, opts);
       }
+      // 记录本次处理后的最终内容，作为下次「拖出撤销」比对的基准
+      const finalContent = await this.app.vault.read(file);
+      this.fileSnapshots.set(file.path, finalContent);
+      // 每次都尝试把磁盘内容推给看板视图（内部会比对 view.data，内容一致时直接跳过）。
+      // 注意不能只在本插件「改写了文件」时才同步：磁盘可能早已是正确内容（例如上一次
+      // 刷新已写好、或内容本就无需变化），此时 applySmartColumns 不产生改动，
+      // 但视图仍可能是陈旧的（kanban 不会自动重读自身文件）——手动刷新就常落在这个分支，
+      // 导致「命令刷新了却毫无变化」。故此处无条件调用，交给 syncKanbanView 自行判重。
+      await this.syncKanbanView(file, finalContent);
     } catch (e) {
       diag(`refreshFile ERROR ${file.path} ${String(e)}`);
       console.error("Smart tasks-kanban: refresh failed", e);
     } finally {
       this.processing = false;
     }
-    // 记录本次处理后的最终内容，作为下次「拖出撤销」比对的基准
-    const finalContent = await this.app.vault.read(file);
-    this.fileSnapshots.set(file.path, finalContent);
-    // 每次都尝试把磁盘内容推给看板视图（内部会比对 view.data，内容一致时直接跳过）。
-    // 注意不能只在本插件「改写了文件」时才同步：磁盘可能早已是正确内容（例如上一次
-    // 刷新已写好、或内容本就无需变化），此时 applySmartColumns 不产生改动，
-    // 但视图仍可能是陈旧的（kanban 不会自动重读自身文件）——手动刷新就常落在这个分支，
-    // 导致「命令刷新了却毫无变化」。故此处无条件调用，交给 syncKanbanView 自行判重。
-    await this.syncKanbanView(file, finalContent);
     diag(`refreshFile END ${file.path}`);
     this.logRenderedCards(file, "afterRefresh");
   }
@@ -998,7 +1028,10 @@ private logKanbanState(
   }
 
   private async refreshAll() {
-    if (this.processing) return;
+    // 不再因 processing 直接 return：刷新已串行排队，重入只会把任务追加到队列尾部
+    // （幂等、lastPushed 判重后多为空跑），丢弃反而会漏刷。旧的重入闸门是
+    // 「processing 为真时 refreshAll 与 refreshFile 并发会交错渲染」时代的防重入手段，
+    // 队列化后已无此风险。
     const files = this.app.vault.getMarkdownFiles();
     for (const file of files) {
       if (isKanbanFile(this.app, file)) {
@@ -1008,14 +1041,12 @@ private logKanbanState(
   }
 
   /**
-   * 设置项变更后的重刷：与 refreshAll 不同，这里不会因 processing 为真而直接放弃。
-   * 否则「恰好在某次刷新进行中改开关」会被静默丢弃，看板就停留在旧渲染，
-   * 表现为「最后关掉的那一项怎么关都不生效」。这里最多等待若干轮让出锁后再刷。
+   * 设置项变更后的重刷：与 refreshAll 的历史差异在于不因 processing 放弃——
+   * 否则「恰好在某次刷新进行中改开关」会被静默丢弃，看板停留在旧渲染，
+   * 表现为「最后关掉的那一项怎么关都不生效」。刷新已串行排队，本调用只会
+   * 追加到队列尾部（最多等之前排队的任务跑完），无需再轮询等锁。
    */
   private async refreshAllAfterSettings() {
-    for (let i = 0; i < 20 && this.processing; i++) {
-      await new Promise((r) => window.setTimeout(r, 150));
-    }
     await this.refreshAll();
   }
 
