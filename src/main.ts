@@ -1110,7 +1110,7 @@ class SettingsTab extends PluginSettingTab {
     const guide = containerEl.createEl("div", {
       cls: "kanban-smart-columns-guide markdown-rendered",
     });
-    void MarkdownRenderer.renderMarkdown(T.guideHead, guide, "", this.plugin);
+    void MarkdownRenderer.render(this.plugin.app, T.guideHead, guide, "", this.plugin);
 
     // source 取值表：手动构建 HTML 表格（不依赖 markdown 表格语法是否被解析）
     for (const group of T.sourceGroups) {
@@ -1128,7 +1128,7 @@ class SettingsTab extends PluginSettingTab {
       }
     }
 
-    void MarkdownRenderer.renderMarkdown(T.guideTail, guide, "", this.plugin);
+    void MarkdownRenderer.render(this.plugin.app, T.guideTail, guide, "", this.plugin);
 
     // 分类标题：把设置项分组，让设置页更有条理（用 Obsidian 原生 setHeading 而非手写 h4，满足社区审核规范）
     const cat = (title: string) =>
