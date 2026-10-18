@@ -854,6 +854,36 @@ export default class KanbanSmartColumns extends Plugin {
       diag("  already pushed identical content (skip)");
       return;
     }
+    // ⚠ 二级判重：看板视图自己保存过（拖拽 / 看板内勾选等 kanban 自身操作）时，
+    // 磁盘内容与视图当前 state 的序列化结果（parser.boardToMd(state)）完全一致——
+    // 视图渲染必然已是最新，直接跳过推送。
+    // 背景（拖拽卡片内容重复 bug 的根因，v0.6.10）：kanban 卡片组件 effect 重跑时
+    // 走 previewCache 命中分支 → migrate() 把新 preview「追加」进 wrapper 而不清空旧
+    // DOM；我们全量清缓存重建 preview 后，旧 preview 成孤儿仍挂在 wrapper 里，拖拽
+    // 改变了落点周围卡片的父实体（effect 依赖变化）→ effect 重跑 → 新旧两个 preview
+    // 叠在同一张卡片上 → 文本重复两遍。跳过无谓推送可从源头消除绝大多数重复场景；
+    // 剩余场景（推送后仍可能产生的孤儿叠加）由 dedupePreviewDOM 兜底清理。
+    try {
+      const smEarly = this.kanbanStateManager(file);
+      const parser = smEarly?.parser as
+        | { boardToMd?: (st: unknown) => string }
+        | undefined;
+      if (
+        parser &&
+        typeof parser.boardToMd === "function" &&
+        smEarly?.state
+      ) {
+        const viewMd = parser.boardToMd(smEarly.state);
+        if (viewMd === content) {
+          this.lastPushed.set(file.path, content);
+          diag("  skip: view state serializes to identical content (kanban saved it itself)");
+          return;
+        }
+        diag(`  view state differs from disk (viewMdLen=${viewMd.length} diskLen=${content.length}) -> push`);
+      }
+    } catch (e) {
+      diag(`  boardToMd check THREW ${String(e)}`);
+    }
     let leaves: WorkspaceLeaf[] = [];
     try {
       leaves = this.app.workspace.getLeavesOfType(KANBAN_VIEW_TYPE);
@@ -875,6 +905,9 @@ export default class KanbanSmartColumns extends Plugin {
         continue;
       }
       diag(`  push: isPrimary=${view.isPrimary} diskLen=${content.length}`);
+
+      // 清缓存前快照旧 preview 组件：推送后用于卸载孤儿组件 + DOM 去重扫尾
+      const oldPreviews = this.snapshotPreviewCache(view);
 
       // ⚠⚠ 关键：必须清掉 kanban 的卡片渲染缓存，否则「隐藏」类改动不会生效。
       // kanban 的 view.prerender() 按**卡片 ID** 查 previewCache 决定是否重渲染：
@@ -909,6 +942,12 @@ export default class KanbanSmartColumns extends Plugin {
             diag("  forceRefresh unavailable");
           }
           this.logKanbanState(sm, "afterForceRefresh");
+          // 兜底去重：清缓存全量重建后，旧 preview 组件的 DOM 可能仍挂在卡片
+          // wrapper 里，与 migrate 进来的新 preview 叠加成「文本重复两遍」
+          // （拖拽场景高发，见 syncKanbanView 开头注释）。立即清一次 +
+          // 800ms 后再清一次（覆盖迟到的异步渲染完成）。
+          this.dedupePreviewDOM(view, oldPreviews);
+          window.setTimeout(() => this.dedupePreviewDOM(view, oldPreviews), 800);
           continue;
         } catch (e) {
           diag(`  newBoard THREW ${String(e)} -> fallback setViewData`);
@@ -974,21 +1013,123 @@ private logKanbanState(
   }
 
   /**
+   * 快照 kanban 视图 previewCache 里现存的所有 preview 组件（清缓存前调用）。
+   * 用途：推送后卸载孤儿组件、以及 DOM 去重扫尾时定位被移除容器的属主组件。
+   */
+  private snapshotPreviewCache(
+    view: unknown
+  ): { containerEl?: HTMLElement }[] {
+    try {
+      const cache = (
+        view as {
+          previewCache?: Map<string, { containerEl?: HTMLElement }>;
+        }
+      ).previewCache;
+      if (!cache || typeof cache.forEach !== "function") return [];
+      const out: { containerEl?: HTMLElement }[] = [];
+      cache.forEach((comp) => {
+        if (comp) out.push(comp);
+      });
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * 清空 kanban 视图的卡片渲染缓存（previewCache / previewQueue）。
+   * v0.6.10 增强：清缓存会把旧 preview 组件从缓存里摘掉、成为无人管理的孤儿——
+   * 其中「已脱离 DOM」的组件再也不会被任何卡片引用，仅泄漏不显示，此处直接从视图
+   * 卸载（removeChild 触发 unload）；「仍挂载在卡片 wrapper 里」的组件不动（贸然
+   * detach 会让 effect 未重跑的卡片变成空白），其残留叠加交给 dedupePreviewDOM 清理。
    * 全特性探测 + try/catch：字段名若在 kanban 升级后变化，最多退化为旧行为。
    */
   private clearKanbanCardCache(view: unknown) {
     try {
       const v = view as {
-        previewCache?: { clear?: () => void; size?: number };
+        previewCache?: Map<string, { containerEl?: HTMLElement }>;
         previewQueue?: { clear?: () => void };
+        removeChild?: (c: unknown) => void;
       };
       const before = v.previewCache?.size;
       v.previewQueue?.clear?.();
-      v.previewCache?.clear?.();
-      diag(`  cleared card cache (was size=${before ?? "?"})`);
+      const orphans: unknown[] = [];
+      const cache = v.previewCache;
+      if (cache && typeof cache.forEach === "function") {
+        cache.forEach((comp) => {
+          const ce = comp?.containerEl;
+          if (ce && ce.isConnected) return; // 仍挂载，不碰
+          orphans.push(comp);
+        });
+        cache.clear();
+      } else {
+        v.previewCache?.clear?.();
+      }
+      for (const comp of orphans) {
+        try {
+          v.removeChild?.(comp);
+        } catch {
+          /* ignore */
+        }
+      }
+      diag(
+        `  cleared card cache (was size=${before ?? "?"}, unloadedOrphans=${orphans.length})`
+      );
     } catch (e) {
       diag(`  clearCardCache THREW ${String(e)}`);
+    }
+  }
+
+  /**
+   * 卡片文本去重扫尾（兜底）：扫描视图 DOM，若同一父容器下挂了多个
+   * markdown preview 容器（「同一张卡片文本重复两遍」的直接症状），保留最后一个
+   * （本插件推送后 migrate 进来的新 preview），其余 detach；被 detach 的容器若属于
+   * 清缓存前快照里的旧组件，一并从视图卸载防泄漏。幂等，可反复调用。
+   */
+  private dedupePreviewDOM(
+    view: unknown,
+    oldComps: { containerEl?: HTMLElement }[]
+  ) {
+    try {
+      const v = view as {
+        contentEl?: HTMLElement;
+        containerEl?: HTMLElement;
+        removeChild?: (c: unknown) => void;
+      };
+      const root = v.contentEl ?? v.containerEl;
+      if (!root) return;
+      // 按直接父容器分组统计 preview 容器（.markdown-preview-view.markdown-rendered
+      // 是 kanban Ll 组件 containerEl 的固定类名，嵌套 transclusion 渲染不会以它作直接子级重复出现）
+      const groups = new Map<HTMLElement, HTMLElement[]>();
+      root
+        .querySelectorAll(".markdown-preview-view.markdown-rendered")
+        .forEach((el) => {
+          const p = el.parentElement;
+          if (!p) return;
+          const arr = groups.get(p);
+          if (arr) arr.push(el as HTMLElement);
+          else groups.set(p, [el as HTMLElement]);
+        });
+      let removed = 0;
+      groups.forEach((els) => {
+        if (els.length < 2) return;
+        for (let i = 0; i < els.length - 1; i++) {
+          const el = els[i];
+          el.detach();
+          removed++;
+          const owner = oldComps.find((c) => c.containerEl === el);
+          if (owner) {
+            try {
+              v.removeChild?.(owner);
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      });
+      if (removed > 0) diag(`  dedupePreviewDOM removed=${removed}`);
+    } catch (e) {
+      diag(`  dedupePreviewDOM THREW ${String(e)}`);
     }
   }
 
