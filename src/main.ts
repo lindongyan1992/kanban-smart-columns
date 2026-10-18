@@ -9,6 +9,7 @@ import {
   Setting,
   MarkdownRenderer,
   Notice,
+  Component,
 } from "obsidian";
 import {
   getSmartColumns,
@@ -1220,6 +1221,10 @@ private logKanbanState(
 
 class SettingsTab extends PluginSettingTab {
   plugin: KanbanSmartColumns;
+  // 托管设置页里 MarkdownRenderer.render 渲染出的子组件：必须用独立 Component
+  // 挂载（不能传 this.plugin，否则 Plugin 生命周期过长导致泄漏——社区审核门禁
+  // no-plugin-as-component 会阻断）。每次重渲染前先 unload 上一个，避免堆积。
+  private guideHost: Component | null = null;
   constructor(plugin: KanbanSmartColumns) {
     super(plugin.app, plugin);
     this.plugin = plugin;
@@ -1227,6 +1232,9 @@ class SettingsTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    // 重渲染前卸载上一次的渲染宿主（释放前次 MarkdownRenderer.render 挂载的子组件）
+    this.guideHost?.unload();
+    this.guideHost = new Component();
 
     const T = I18N[this.plugin.settings.language];
 
@@ -1251,7 +1259,7 @@ class SettingsTab extends PluginSettingTab {
     const guide = containerEl.createEl("div", {
       cls: "kanban-smart-columns-guide markdown-rendered",
     });
-    void MarkdownRenderer.render(this.plugin.app, T.guideHead, guide, "", this.plugin);
+    void MarkdownRenderer.render(this.plugin.app, T.guideHead, guide, "", this.guideHost);
 
     // source 取值表：手动构建 HTML 表格（不依赖 markdown 表格语法是否被解析）
     for (const group of T.sourceGroups) {
@@ -1269,7 +1277,7 @@ class SettingsTab extends PluginSettingTab {
       }
     }
 
-    void MarkdownRenderer.render(this.plugin.app, T.guideTail, guide, "", this.plugin);
+    void MarkdownRenderer.render(this.plugin.app, T.guideTail, guide, "", this.guideHost);
 
     // 分类标题：把设置项分组，让设置页更有条理（用 Obsidian 原生 setHeading 而非手写 h4，满足社区审核规范）
     const cat = (title: string) =>
