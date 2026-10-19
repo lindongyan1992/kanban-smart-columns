@@ -1,4 +1,5 @@
 import { App, TFile } from "obsidian";
+import { diag } from "./diag";
 import {
   ScannedTask,
   scanTasks,
@@ -509,6 +510,10 @@ export async function revertMovedFromDone(
   let changed = false;
   const revertedSources: TFile[] = [];
   const pendingUndone: { basename: string | null; text: string }[] = [];
+  // 诊断：记录本次比较的候选（prev 完成列里的卡片 vs cur 其它列的 [x] 卡片）及匹配结果。
+  // sameCard 用 cardText 做全等比较，一旦两边文本有细微差异（emoji 显隐、多余空格、
+  // 日期后缀）就会失配 → 撤销被静默跳过 → ✅ 日期不消失。
+  const dbgUnmatched: string[] = [];
   for (let i = 0; i < lines.length; i++) {
     if (inSkip(i)) continue;
     const cm = /^- \[[xX]\]\s+(.*)$/.exec(lines[i]);
@@ -522,12 +527,29 @@ export async function revertMovedFromDone(
     };
     if (prevDone.some((p) => sameCard(p, curCard))) {
       let updated = lines[i].replace(/\[[xX]\]/, "[ ]");
-      // 无来源卡撤销时，清掉卡片行上记录的完成日期（若有），避免残留 ✅
-      if (!lm) updated = updated.replace(/\s*\u{2705}\s*\d{4}-\d{2}-\d{2}/gu, "");
+      // 撤销完成时**无条件**清掉卡片行上残留的完成日期 ✅（2026-10-19 修复）。
+      // 旧实现只在无来源链接（!lm）时才清，于是带[[来源]] 的卡片其卡片行上的 ✅
+      // 永远清不掉 —— 撤销表现为「复选框回到未完成，但 ✅ 日期仍留在卡片上」。
+      // 带来源卡的 ✅ 本就由 markTaskUndone 在源笔记里清除（该处亦是无条件清除），
+      // 卡片行上的这份属 kanban / 历史操作残留，理应一并清掉。
+      updated = updated.replace(/\s*\u{2705}\s*\d{4}-\d{2}-\d{2}/gu, "");
       lines[i] = updated;
       changed = true;
       pendingUndone.push({ basename: curCard.basename, text: curCard.text });
+    } else {
+      dbgUnmatched.push(
+        `${curCard.hasLink ? "@" : "#"}${curCard.basename ?? ""}|${curCard.text}`
+      );
     }
+  }
+  diag(
+    `  [revert] doneCol="${doneCol}" prevDone=${prevDone.length} matched=${
+      pendingUndone.length
+    } unmatched=${dbgUnmatched.length}`
+  );
+  if (pendingUndone.length === 0 && dbgUnmatched.length > 0) {
+    diag(`  [revert] prevDoneTexts=${JSON.stringify(prevDone.map((p) => p.text))}`);
+    diag(`  [revert] unmatchedTexts=${JSON.stringify(dbgUnmatched)}`);
   }
   if (!changed) return { changed: false, revertedSources: [] };
 

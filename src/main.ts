@@ -3,7 +3,6 @@ import {
   Plugin,
   TFile,
   WorkspaceLeaf,
-  DataAdapter,
   debounce,
   PluginSettingTab,
   Setting,
@@ -11,6 +10,7 @@ import {
   Notice,
   Component,
 } from "obsidian";
+import { diag, setDiagEnabled, clearDiag, initDiagAdapter } from "./diag";
 import {
   getSmartColumns,
   isKanbanFile,
@@ -31,56 +31,8 @@ type Lang = "zh" | "en";
  */
 const KANBAN_VIEW_TYPE = "kanban";
 
-/**
- * 诊断日志：把「设置落盘 / 是否改写文件 / 找到几个看板视图 / 视图数据是否一致 / 报错」
- * 全程写进插件目录下的 diag.txt（超过体积上限时自动截断，只保留最近部分）。
- * 用途：这类「改了没生效」的问题涉及 Obsidian 运行时与另一个插件的视图状态，
- * 静态读代码/读磁盘都无法判定，必须靠运行时日志拿到事实，避免反复猜测。
- */
-const DIAG_MAX_BYTES = 120 * 1024;
-const DIAG_PATH = ".obsidian/plugins/kanban-smart-columns/diag.txt";
-let DIAG_ADAPTER: DataAdapter | null = null;
-let DIAG_ENABLED = false;
-let diagQueue: Promise<void> = Promise.resolve();
-
-/** 由设置项「调试模式」控制是否写诊断日志（关闭时完全静默，不产生任何磁盘写入）。 */
-export function setDiagEnabled(v: boolean) {
-  DIAG_ENABLED = v;
-}
-
-/** 清空诊断日志文件。 */
-export async function clearDiag() {
-  const ad = DIAG_ADAPTER;
-  if (!ad) return;
-  try {
-    await ad.write(DIAG_PATH, "");
-  } catch {
-    /* 忽略 */
-  }
-}
-
-export function diag(msg: string) {
-  const ad = DIAG_ADAPTER;
-  if (!ad || !DIAG_ENABLED) return;
-  const line = `${new Date().toISOString().slice(11, 23)} ${msg}\n`;
-  // 串行写入，避免并发 read-modify-write 互相覆盖
-  diagQueue = diagQueue
-    .then(async () => {
-      let prev = "";
-      try {
-        prev = await ad.read(DIAG_PATH);
-      } catch {
-        prev = "";
-      }
-      if (prev.length > DIAG_MAX_BYTES) {
-        prev = prev.slice(Math.floor(prev.length / 2));
-      }
-      await ad.write(DIAG_PATH, prev + line);
-    })
-    .catch(() => {
-      // 诊断日志失败不影响功能
-    });
-}
+// 诊断日志实现在独立模块 src/diag.ts（smartColumns.ts 也需写日志，独立成模块
+// 可避免与 main.ts 形成循环依赖）。
 
 interface SmartColumnsSettings {
   autoRefresh: boolean;
@@ -525,6 +477,16 @@ export default class KanbanSmartColumns extends Plugin {
   private processing = false;
   // 记录每个看板文件上一次处理完成后的内容，用于检测「卡片从完成列被拖出」以触发撤销
   private fileSnapshots: Map<string, string> = new Map();
+
+  // 发生过「撤销（拖出完成列）」的看板文件：其**下一轮**刷新必须清渲染缓存并强制重画。
+  //
+  // 背景（v0.6.13）：kanban 把卡片行里的「✅ YYYY-MM-DD」解析为 done-date 元数据并
+  // 渲染成**独立徽章**，不在 preview 标题文本里。撤销把文件里的 ✅ 删掉后，徽章不会
+  // 自行消失，必须重建卡片 DOM。而撤销本身会改写看板文件 → 再触发一轮 modify →
+  // 那一轮 prevContent 已是撤销后内容、revert 返回 changed=false，若直接用返回值
+  // 当参数，真正需要重建的那次刷新恰好拿不到标志（日志实证：
+  // `[revert] matched=1` 之后的 refreshFile 仍是 clearCache=false）。故跨轮次传递。
+  private undoRerenderPending = new Set<string>();
   // 设置写盘队列：把多次 saveSettings 串行化，避免并发写盘乱序覆盖（见 saveSettings）
   private writeQueue: Promise<void> = Promise.resolve();
   // 每个看板文件「我们上次推送给视图的内容」，用于视图同步的判重（见 syncKanbanView）
@@ -560,7 +522,7 @@ export default class KanbanSmartColumns extends Plugin {
     await this.loadSettings();
     // 初始化诊断日志（写到插件目录，不经过 vault 内容，不会触发看板刷新）
     try {
-      DIAG_ADAPTER = this.app.vault.adapter;
+      initDiagAdapter(this.app.vault.adapter);
       setDiagEnabled(this.settings.debugMode);
       diag(
         `=== onload v${this.manifest.version} settings=${JSON.stringify(
@@ -568,7 +530,7 @@ export default class KanbanSmartColumns extends Plugin {
         )}`
       );
     } catch {
-      DIAG_ADAPTER = null;
+      initDiagAdapter(null);
     }
     this.addSettingTab(new SettingsTab(this));
 
@@ -660,6 +622,17 @@ export default class KanbanSmartColumns extends Plugin {
         prevContent,
         opts
       );
+      // ⚠ 撤销一旦发生，本文件的下一轮刷新**必须重渲染**。
+      //
+      // 为什么不直接用 undoResult.changed 当参数：撤销会改写看板文件，从而再触发
+      // 一轮 modify（多轮 modify 还会被去抖合并），那一轮 revertMovedFromDone 因
+      // prevContent 已是撤销后内容而返回 changed=false，clearCache 又变回 false——
+      // 真正需要重建 DOM 的那次刷新恰好拿不到标志（见 diag 日志：撤销 matched=1
+      // 之后的 refreshFile 仍是 clearCache=false）。故用文件级标记跨轮次传递，
+      // 由下一次 refreshFile 消费后清除。
+      if (undoResult.changed) {
+        this.undoRerenderPending.add(file.path);
+      }
       // 2) 全局勾选回写（扫描非完成列的 [x] 卡片）——受「完成后回写」开关控制
       if (this.settings.syncBack) {
         await syncBackCompletions(
@@ -682,7 +655,19 @@ export default class KanbanSmartColumns extends Plugin {
     } finally {
       this.processing = false;
     }
-    await this.refreshFile(file);
+    // 撤销（拖出完成列）发生的那一轮必须重渲染：kanban 把「✅ YYYY-MM-DD」解析为
+    // 卡片元数据（doneDate 字段）并渲染成**独立徽章**，不在 preview 标题文本里。
+    // 文件层的 ✅ 被撤销删除后，徽章不会自行消失，必须重建卡片 DOM 才会刷新。
+    //
+    // ⚠ 不依赖「下一轮 modify」来消费标记：撤销引发的那轮 modify 未必会走到这里
+    // （diag 日志实证：matched=1 之后根本没有对应的 refreshFile，而后续轮次拿到的
+    // clearCache仍是 false → 徽章永远不重建）。故撤销发生时**主动**排一次
+    // clearCache=true 的刷新，标志保留到真正被消费为止。
+    if (undoResult.changed) {
+      await this.refreshFile(file, true);
+    } else {
+      await this.refreshFile(file, this.undoRerenderPending.delete(file.path));
+    }
     // 撤销完成状态后，源笔记的完成标记虽已回写，但 Obsidian 元数据缓存可能尚未刷新，
     // 导致 scanTasks 仍认为该任务「已完成」、无法立即在智能列重现。
     // 等待源笔记缓存更新后再刷新一次看板，使撤销后的任务立即回到（逾期 / 到期等）智能列，免去手动刷新。
