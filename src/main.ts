@@ -707,18 +707,25 @@ export default class KanbanSmartColumns extends Plugin {
    * 刷新入口：把实际刷新任务排入串行队列（见 refreshQueue 注释），避免多事件源
    * 并发交错导致卡片重复渲染。返回队列尾部 Promise，调用方 await 即等本轮（及
    * 之前排队的）刷新全部完成。
+   *
+   * @param clearCache 是否清空 kanban 的卡片渲染缓存。**仅设置项变更时传 true**：
+   *   清缓存会迫使 kanban 为每张卡片重建 preview 组件，旧 preview 的 DOM 仍挂在
+   *   卡片 wrapper 里，新旧叠加即产生「文本重复」，且 kanban 的渲染落地比我们的
+   *   推送晚 0.5～2 秒（见 diag 日志 RENDERED[afterRefresh] 与 dedupe 的时间差），
+   *   用户会看到重复闪烁。日常刷新（modify/拖拽/定时/命令）不清缓存，让 kanban
+   *   复用既有 preview，从根上不产生重复。
    */
-  private refreshFile(file: TFile): Promise<void> {
-    const run = () => this.doRefreshFile(file);
+  private refreshFile(file: TFile, clearCache = false): Promise<void> {
+    const run = () => this.doRefreshFile(file, clearCache);
     this.refreshQueue = this.refreshQueue.then(run, run);
     return this.refreshQueue;
   }
 
-  private async doRefreshFile(file: TFile) {
+  private async doRefreshFile(file: TFile, clearCache: boolean) {
     const defs = getSmartColumns(this.app, file);
     if (defs.length === 0) return;
     diag(
-      `refreshFile START ${file.path} processing=${this.processing} opts=${JSON.stringify(
+      `refreshFile START ${file.path} processing=${this.processing} clearCache=${clearCache} opts=${JSON.stringify(
         this.cardOpts()
       )}`
     );
@@ -748,7 +755,7 @@ export default class KanbanSmartColumns extends Plugin {
       // 刷新已写好、或内容本就无需变化），此时 applySmartColumns 不产生改动，
       // 但视图仍可能是陈旧的（kanban 不会自动重读自身文件）——手动刷新就常落在这个分支，
       // 导致「命令刷新了却毫无变化」。故此处无条件调用，交给 syncKanbanView 自行判重。
-      await this.syncKanbanView(file, finalContent);
+      await this.syncKanbanView(file, finalContent, clearCache);
     } catch (e) {
       diag(`refreshFile ERROR ${file.path} ${String(e)}`);
       console.error("Smart tasks-kanban: refresh failed", e);
@@ -842,7 +849,11 @@ export default class KanbanSmartColumns extends Plugin {
    * 全部特性探测 + try/catch：kanban 升级改了内部结构时最多退化为原「需重开标签页」行为，
    * 不会报错影响看板。
    */
-  private async syncKanbanView(file: TFile, content: string) {
+  private async syncKanbanView(
+    file: TFile,
+    content: string,
+    clearCache = false
+  ) {
     // 内容必须仍是看板；否则 kanban 会把视图切成 markdown 模式（破坏性副作用）
     if (!/kanban-plugin:\s*board/.test(content)) {
       diag(`sync SKIP (content not a board) ${file.path}`);
@@ -910,14 +921,25 @@ export default class KanbanSmartColumns extends Plugin {
       // 清缓存前快照旧 preview 组件：推送后用于卸载孤儿组件 + DOM 去重扫尾
       const oldPreviews = this.snapshotPreviewCache(view);
 
-      // ⚠⚠ 关键：必须清掉 kanban 的卡片渲染缓存，否则「隐藏」类改动不会生效。
-      // kanban 的 view.prerender() 按**卡片 ID** 查 previewCache 决定是否重渲染：
-      //   `this.previewCache.has(i.id) || this.previewQueue.add(...)` —— 命中就复用旧 DOM。
-      // 卡片 ID 不随内容变化，故「显示 emoji」是新卡片渲染（看起来生效），
-      // 而「隐藏 emoji」命中缓存被跳过 → 界面不变。这正是「显示立刻生效、隐藏没反应」的真因。
-      // kanban 自己的 setViewData(content, **true**) 就是靠这个 clear 分支清缓存；
-      // 我们此前一直传 false，等于从不清理。
-      this.clearKanbanCardCache(view);
+      // ⚠⚠ 清 kanban 卡片渲染缓存：只在**设置项变更**时需要（clearCache=true）。
+      //
+      // 为什么必须清（设置变更场景）：kanban 的 view.prerender() 按**卡片 ID** 查
+      // previewCache 决定是否重渲染：`previewCache.has(i.id) || queue.add(...)`
+      // —— 命中就复用旧 DOM。卡片 ID 不随内容变化，故「隐藏 emoji」这类改动若命中
+      // 缓存会被跳过 → 界面不变。这正是「显示立刻生效、隐藏没反应」的真因。
+      //
+      // 为什么日常刷新**不能**清（clearCache=false，v0.6.12 关键修正）：
+      // 清缓存迫使 kanban 为每张卡片重建 preview 组件，而旧 preview 的 DOM 仍挂在
+      // 卡片 wrapper 里；卡片 effect 重跑时命中缓存走 `migrate(wrapper)`——其实现是
+      // `a.parentElement!==r && r.append(a)`，**不清空 wrapper** → 新旧 preview 叠加
+      // → 「文本重复两遍」。实测（diag 日志）我们的推送在 t=0 完成，而 kanban 真正把
+      // DOM 渲染落地要晚 0.5～2 秒，这段窗口里重复清晰可见，直到 kanban 自身下一轮
+      // 干净渲染才自愈——正是用户看到的「拖拽后下方卡片短暂重复」。
+      // 故：日常刷新（modify/拖拽/定时/命令）一律不清缓存，让 kanban 复用既有
+      // preview，从根上不产生重复；只有设置变更才清，确保显示类开关立即生效。
+      if (clearCache) {
+        this.clearKanbanCardCache(view);
+      }
 
       // 首选：直接调用 kanban stateManager.newBoard(view, content)——
       // 它会用我们的内容重新解析并 setState，绕过 registerView 的 isPrimary 降级分支。
@@ -932,12 +954,21 @@ export default class KanbanSmartColumns extends Plugin {
           // ⚠ 再调 forceRefresh()：setState 内部会 `viewSet.forEach(s => s.validatePreviewCache(a))`
           // 按**卡片 ID** 修剪缓存，而卡片 ID 不随内容变化 → 旧 widget 被原样保留、DOM 不更新。
           // forceRefresh() 会 `reparseBoard()` + `stateReceivers.forEach(...)` 强制全量重画。
+          //
+          // ⚠ v0.6.12：forceRefresh 同样只在**清缓存时**才调。日常刷新若也强制全量重画，
+          // 会让每张卡片 effect 重跑 → 命中缓存走 migrate（不清空 wrapper）→ 依旧叠加
+          // 重复。不清缓存时，newBoard 内部的 setState + validatePreviewCache 已足够让
+          // kanban 按新 state 更新卡片，无需再叠加一次强制重画。
           if (typeof sm.forceRefresh === "function") {
-            try {
-              sm.forceRefresh();
-              diag("  forceRefresh OK");
-            } catch (e) {
-              diag(`  forceRefresh THREW ${String(e)}`);
+            if (clearCache) {
+              try {
+                sm.forceRefresh();
+                diag("  forceRefresh OK");
+              } catch (e) {
+                diag(`  forceRefresh THREW ${String(e)}`);
+              }
+            } else {
+              diag("  forceRefresh skipped (clearCache=false)");
             }
           } else {
             diag("  forceRefresh unavailable");
@@ -945,10 +976,17 @@ export default class KanbanSmartColumns extends Plugin {
           this.logKanbanState(sm, "afterForceRefresh");
           // 兜底去重：清缓存全量重建后，旧 preview 组件的 DOM 可能仍挂在卡片
           // wrapper 里，与 migrate 进来的新 preview 叠加成「文本重复两遍」
-          // （拖拽场景高发，见 syncKanbanView 开头注释）。立即清一次 +
-          // 800ms 后再清一次（覆盖迟到的异步渲染完成）。
+          // （拖拽场景高发，见 syncKanbanView 开头注释）。
+          //
+          // ⚠ v0.6.12：不能再只靠「立即 + 800ms」两次定时去重。kanban 的重渲染是
+          // **异步**的（prerender / forceRefresh 之后的 React 提交时刻不固定），
+          // 重复可能在两次定时之间、甚至 800ms 之后才落到 DOM → 漏清 → 用户看到
+          // 「卡片短暂重复，随后又自己好了」（下一轮干净渲染里 Ll.render() 先
+          // containerEl.empty() 再渲染，把重复冲掉）。
+          // 改为：挂 MutationObserver 监听期间内一切 DOM 变化，一旦出现重复
+          // 立刻清掉；观察器只是「加速去重」，不改变渲染流程，故无副作用。
           this.dedupePreviewDOM(view, oldPreviews);
-          window.setTimeout(() => this.dedupePreviewDOM(view, oldPreviews), 800);
+          this.watchAndDedupePreviewDOM(view, oldPreviews, 2500);
           continue;
         } catch (e) {
           diag(`  newBoard THREW ${String(e)} -> fallback setViewData`);
@@ -957,12 +995,16 @@ export default class KanbanSmartColumns extends Plugin {
         diag("  stateManager/newBoard unavailable -> fallback setViewData");
       }
 
-      // 回退路径：注意第二个参数必须是 true（= 清空渲染缓存）
+      // 回退路径：第二个参数 clear 只在设置变更时为 true（= 清空渲染缓存）；
+      // 日常刷新传 false，复用既有 preview，避免新旧叠加产生重复。
       try {
-        view.setViewData?.(content, true);
+        view.setViewData?.(content, clearCache);
         view.data = content;
         this.lastPushed.set(file.path, content);
-        diag("  setViewData(clear=true) OK (fallback)");
+        diag(`  setViewData(clear=${clearCache}) OK (fallback)`);
+        // 回退路径同样需要实时去重（setViewData 后的重渲染也是异步的）
+        this.dedupePreviewDOM(view, oldPreviews);
+        this.watchAndDedupePreviewDOM(view, oldPreviews, 2500);
       } catch (e) {
         diag(`  setViewData THREW ${String(e)}`);
         console.error("Smart tasks-kanban: sync kanban view failed", e);
@@ -1039,10 +1081,17 @@ private logKanbanState(
 
   /**
    * 清空 kanban 视图的卡片渲染缓存（previewCache / previewQueue）。
-   * v0.6.10 增强：清缓存会把旧 preview 组件从缓存里摘掉、成为无人管理的孤儿——
-   * 其中「已脱离 DOM」的组件再也不会被任何卡片引用，仅泄漏不显示，此处直接从视图
-   * 卸载（removeChild 触发 unload）；「仍挂载在卡片 wrapper 里」的组件不动（贸然
-   * detach 会让 effect 未重跑的卡片变成空白），其残留叠加交给 dedupePreviewDOM 清理。
+   *
+   * ⚠ v0.6.12 踩坑记录（务必保留此约束）：
+   * 曾尝试「把所有旧 preview 一律 detach + 卸载」以求从源头消除重复，结果**卡片内容
+   * 直接消失**。原因：仍挂载在卡片 wrapper 里的 preview 被 detach 后，若该卡片的
+   * React effect 没有立即重跑，wrapper 就是空的 → 卡片空白；而 kanban 并不保证
+   * 每次推送后所有卡片 effect 都重跑。
+   *
+   * 正确做法（当前）：只清 Map（让 kanban 按需重建），并把「已脱离 DOM」的旧组件
+   * 从视图卸载防泄漏；「仍挂载」的组件一律不动，其可能与新 preview 叠加的问题
+   * 交给 dedupePreviewDOM / MutationObserver 在**渲染后**擦除——宁可晚一帧把重复
+   * 擦掉，也绝不能制造空白。
    * 全特性探测 + try/catch：字段名若在 kanban 升级后变化，最多退化为旧行为。
    */
   private clearKanbanCardCache(view: unknown) {
@@ -1059,25 +1108,91 @@ private logKanbanState(
       if (cache && typeof cache.forEach === "function") {
         cache.forEach((comp) => {
           const ce = comp?.containerEl;
-          if (ce && ce.isConnected) return; // 仍挂载，不碰
+          // ⚠ 仍挂载的一律不碰：detach 会让「effect 未重跑」的卡片变空白。
+          if (ce && ce.isConnected) return;
           orphans.push(comp);
         });
         cache.clear();
       } else {
         v.previewCache?.clear?.();
       }
+      let unloaded = 0;
       for (const comp of orphans) {
         try {
           v.removeChild?.(comp);
+          unloaded++;
         } catch {
           /* ignore */
         }
       }
       diag(
-        `  cleared card cache (was size=${before ?? "?"}, unloadedOrphans=${orphans.length})`
+        `  cleared card cache (was size=${before ?? "?"}, unloadedOrphans=${unloaded})`
       );
     } catch (e) {
       diag(`  clearCardCache THREW ${String(e)}`);
+    }
+  }
+
+  /**
+   * 在指定时间窗口内监听视图 DOM 变化，实时清理「同一卡片文本重复」的叠加。
+   *
+   * 背景（v0.6.12 修复「卡片短暂重复后自愈」）：kanban 清缓存后的重渲染是
+   * 异步的——旧 preview 的 DOM 仍挂在卡片 wrapper 里，新 preview 何时被
+   * migrate/React 提交追加进来并不固定。此前只在推送后跑「立即 + 800ms」
+   * 两次定时去重，重复若落在这两次之间（或 800ms 之后）就会被漏掉，用户会看到
+   * 一段「卡片文本重复两遍」的窗口期；直到下一轮干净渲染（Ll.render() 内先
+   * containerEl.empty() 再渲染）才自行恢复——正是「短暂重复、随后自愈」的现象。
+   *
+   * 这里用 MutationObserver 在窗口期内对任何 childList 变化都触发一次幂等去重，
+   * 抓住「重复一落 DOM 就清掉」，从根上消除可见的重复窗口。
+   * 纯观察者：不改变 kanban 渲染流程，不 detach 唯一 preview（只处理 ≥2 的叠加），
+   * 故无副作用；窗口结束后自动断开并做最后一次去重。
+   */
+  private watchAndDedupePreviewDOM(
+    view: unknown,
+    oldComps: { containerEl?: HTMLElement }[],
+    durationMs: number
+  ) {
+    try {
+      const v = view as {
+        contentEl?: HTMLElement;
+        containerEl?: HTMLElement;
+      };
+      const root = v.contentEl ?? v.containerEl;
+      if (!root || typeof MutationObserver === "undefined") {
+        // 环境不支持时退化为「窗口结束后补一次」
+        window.setTimeout(() => this.dedupePreviewDOM(view, oldComps), durationMs);
+        return;
+      }
+      let timer: number | undefined;
+      let pending: number | undefined;
+      const finish = () => {
+        try {
+          observer.disconnect();
+        } catch {
+          /* ignore */
+        }
+        if (timer !== undefined) window.clearTimeout(timer);
+        if (pending !== undefined) window.clearTimeout(pending);
+        this.dedupePreviewDOM(view, oldComps);
+      };
+      // 去重是幂等的：清完后回调再触发也查不到重复，会自然收敛，无需「忽略自身
+      // 变动」的保护。这里只做 16ms 节流，避免 kanban 一次提交上百个节点时
+      // 触发成百上千次全量 querySelectorAll。
+      const observer = new MutationObserver(() => {
+        if (pending !== undefined) return;
+        pending = window.setTimeout(() => {
+          pending = undefined;
+          this.dedupePreviewDOM(view, oldComps);
+        }, 16);
+      });
+      observer.observe(root, { childList: true, subtree: true });
+      timer = window.setTimeout(finish, durationMs);
+      diag(`  watchAndDedupe armed for ${durationMs}ms`);
+    } catch (e) {
+      diag(`  watchAndDedupe THREW ${String(e)}`);
+      // 兜底：观察器建不起来也至少补一次延迟去重
+      window.setTimeout(() => this.dedupePreviewDOM(view, oldComps), durationMs);
     }
   }
 
@@ -1129,8 +1244,51 @@ private logKanbanState(
         }
       });
       if (removed > 0) diag(`  dedupePreviewDOM removed=${removed}`);
+      // 诊断：即使「同父级多 preview」这一形态没命中，也把每张卡片的 preview
+      // 数量分布记下来——若某张卡片 preview 数 ≠1，说明重复是「多 wrapper」
+      // 形态（parentElement 分组抓不到），需据此改检测口径。
+      this.diagCardPreviewCounts(view);
     } catch (e) {
       diag(`  dedupePreviewDOM THREW ${String(e)}`);
+    }
+  }
+
+  /**
+   * 诊断用：统计每个卡片容器下挂了多少 markdown preview 容器，并记下 >1 的异常。
+   * 只在 debugMode 开启时产出（diag 本身受 debugMode 门控）。
+   */
+  private diagCardPreviewCounts(view: unknown) {
+    try {
+      const v = view as { contentEl?: HTMLElement; containerEl?: HTMLElement };
+      const root = v.contentEl ?? v.containerEl;
+      if (!root) return;
+      // 卡片预览 wrapper：kanban 渲染时用 markdown-preview-wrapper 类
+      const cards = Array.from(
+        root.querySelectorAll(".markdown-preview-wrapper")
+      ) as HTMLElement[];
+      const bad: string[] = [];
+      cards.forEach((card, idx) => {
+        const n = card.querySelectorAll(".markdown-preview-view").length;
+        if (n !== 1) {
+          bad.push(`#${idx}=${n}子:${card.children.length}`);
+        }
+      });
+      if (bad.length > 0) {
+        diag(
+          `  [cardPreview] cards=${cards.length} abnormal=${bad.length} :: ${bad
+            .slice(0, 12)
+            .join(" | ")}`
+        );
+        // 抓第一张异常卡片的结构，便于判断重复的真实形态
+        const first = cards.find(
+          (c) => c.querySelectorAll(".markdown-preview-view").length !== 1
+        );
+        if (first) {
+          diag(`  [cardPreview] sampleHTML=${first.outerHTML.slice(0, 900)}`);
+        }
+      }
+    } catch (e) {
+      diag(`  diagCardPreviewCounts THREW ${String(e)}`);
     }
   }
 
@@ -1189,7 +1347,15 @@ private logKanbanState(
    * 追加到队列尾部（最多等之前排队的任务跑完），无需再轮询等锁。
    */
   private async refreshAllAfterSettings() {
-    await this.refreshAll();
+    // 设置变更必须清卡片渲染缓存：显示类开关（如「显示优先级/到期 emoji」）靠清缓存
+    // 才能让 kanban 重渲染卡片（卡片 ID 不变 → 命中缓存则跳过渲染）。
+    // 这是唯一允许 clearCache=true 的路径。
+    const files = this.app.vault.getMarkdownFiles();
+    for (const file of files) {
+      if (isKanbanFile(this.app, file)) {
+        await this.refreshFile(file, true);
+      }
+    }
   }
 
   async loadSettings() {
