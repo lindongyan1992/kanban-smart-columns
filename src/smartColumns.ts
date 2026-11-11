@@ -1,5 +1,5 @@
 import { App, TFile } from "obsidian";
-import { diag } from "./diag";
+import { diag, isDiagEnabled } from "./diag";
 import {
   ScannedTask,
   scanTasks,
@@ -238,7 +238,9 @@ function replaceColumnRegion(
     }
   }
 
-  const cardLines = cards.length ? cards : ["- [ ] （暂无匹配任务）"];
+  // 空列就真的留空——不再插入「（暂无匹配任务）」占位卡（主人 2026-10-20 要求）。
+  // 该占位卡会被 kanban 渲染成一张真实卡片，视觉上与真正的待办无异，容易被误认/误拖。
+  const cardLines = cards;
   // 智能列：把列标题补上「（智能列）」后缀，便于肉眼区分自动列与手写列；
   // 匹配时用 stripSmartSuffix 兼容「已带后缀」与「未带后缀」两种形态。
   let headerLine = lines[startIdx];
@@ -424,12 +426,15 @@ export async function autoCompleteInDoneColumn(
     lines[i] = updated;
     changed = true;
     pending.push({ basename, text });
+    diag(`  [autoComplete] mark done: "${text}" basename=${basename}`);
   }
 
   if (!changed) return false;
+  diag(`  [autoComplete] 完成列(=${doneCol}) 待打勾 ${pending.length} 张，开始写回看板`);
 
   // 写回看板（把完成列里的卡片标记为完成）
   await app.vault.process(file, () => lines.join("\n"));
+  diag(`  [autoComplete] 已写回看板，完成列打勾完成`);
 
   // 回写来源笔记（源任务标记为完成 + 补 ✅ 完成日期；循环任务自动续期）
   for (const p of pending) {
@@ -440,6 +445,102 @@ export async function autoCompleteInDoneColumn(
     }
   }
   return true;
+}
+
+/**
+ * 诊断快照：记录看板最终落盘后，各**手写列**（含完成列）的卡片归属与勾选状态。
+ * 仅 debugMode 下由 diag() 实际写盘。用于排查「卡片被拖入完成列后又弹回原列」类竞态：
+ * 若 autoComplete 写完后本快照显示卡已在完成列 [x]，而下一轮 onModify 的快照里卡
+ * 又回到原手写列 [ ]，即为 kanban 异步保存用旧 state 覆盖了我们的写入。
+ */
+export async function diagBoardSnapshot(
+  app: App,
+  file: TFile,
+  opts: CardTextOpts
+): Promise<void> {
+  const done = getDoneColumn(app, file);
+  const smart = new Set(getSmartColumns(app, file).map((d) => d.column));
+  const content = await app.vault.read(file);
+  const lines = content.split("\n");
+  const headers: { name: string; idx: number }[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const h = /^##\s+(.*)$/.exec(lines[i]);
+    if (h) headers.push({ name: h[1].trim(), idx: i });
+  }
+  const parts: string[] = [];
+  for (let k = 0; k < headers.length; k++) {
+    if (smart.has(headers[k].name)) continue; // 只关心手写列 + 完成列
+    const s = headers[k].idx;
+    const e = k + 1 < headers.length ? headers[k + 1].idx : lines.length;
+    const cards = lines
+      .slice(s + 1, e)
+      .filter((l) => /^- \[[ xX]\]/.test(l))
+      .map((l) => l.trim());
+    parts.push(`${headers[k].name}[${cards.length}]: ${cards.join(" | ")}`);
+  }
+  diag(`  [snapshot] doneCol="${done}" ${parts.join(" || ")}`);
+}
+
+/**
+ * 诊断：对比「插件上次快照 prevContent」与「磁盘当前内容」的**卡片列归属差异**。
+ *
+ * 用途：一次性判定「卡片拖入完成列后又弹回原列」的真正凶手，替代靠猜。
+ * 两种可能的凶手在日志里形态完全不同：
+ *   - **外部覆盖（kanban 用拖拽前旧 state 重存）**：某卡 prev 在完成列、cur 不在完成列，
+ *     但这一轮日志里**既无** [autoComplete] **也无** [revert] 命中该卡 → 我们没写过它，
+ *     是 kanban 覆盖的。
+ *   - **内部误伤（本插件的「拖出即撤销」）**：同一轮出现 [revert] matched 命中该卡 →
+ *     是 revertMovedFromDone 把它当成用户拖出、主动翻回 [ ]（并清 ✅）。
+ *
+ * 仅 debugMode 开启时读盘并输出；关闭时直接返回，零 I/O。
+ */
+export async function diagColumnDiff(
+  app: App,
+  file: TFile,
+  prevContent: string | null,
+  opts: CardTextOpts
+): Promise<void> {
+  if (!prevContent || !isDiagEnabled()) return;
+  const cur = await app.vault.read(file);
+  if (cur === prevContent) return; // 本轮无变化，无需比较
+
+  // 把「内容」摊平成 { 卡片文本 -> 所在列 }，同名卡取首次出现的列。
+  const mapOf = (content: string) => {
+    const lines = content.split("\n");
+    const map = new Map<string, string>();
+    let col = "";
+    for (const raw of lines) {
+      const t = raw.trim();
+      if (t.startsWith("## ")) {
+        col = stripSmartSuffix(t.slice(3).trim());
+        continue;
+      }
+      if (!col) continue;
+      const cm = /^- \[[ xX]\]\s+(.*)$/.exec(t);
+      if (!cm) continue;
+      const text = cardText(cm[1], opts);
+      if (text && !map.has(text)) map.set(text, col);
+    }
+    return map;
+  };
+
+  const prev = mapOf(prevContent);
+  const curr = mapOf(cur);
+  const moved: string[] = [];
+  for (const [text, col] of curr) {
+    const p = prev.get(text);
+    if (p !== undefined && p !== col) moved.push(`${p} -> ${col}:"${text}"`);
+  }
+  const vanished: string[] = [];
+  for (const [text, col] of prev) {
+    if (!curr.has(text)) vanished.push(`${col}:"${text}"`);
+  }
+  if (moved.length === 0 && vanished.length === 0) return;
+  diag(
+    `  [coldiff] 换列 ${moved.length} 消失 ${vanished.length}` +
+      (moved.length ? ` | ${moved.join(" ; ")}` : "") +
+      (vanished.length ? ` | 消失: ${vanished.join(" ; ")}` : "")
+  );
 }
 
 // ---------- 撤销：把「从完成列拖出」的卡片还原为未完成 ----------
@@ -730,6 +831,136 @@ export async function archiveOldDone(
 
   await app.vault.process(file, () => newLines.join("\n"));
   return true;
+}
+
+// ---------- 防呆：把手写列卡片拖进智能列后自动归位 ----------
+// 背景：智能列每次都由 scanTasks 重算「整列重写」(replaceColumnRegion)，手写列里
+// 「无对应源任务」的卡片一旦被拖进智能列，下一轮重写就会被当垃圾清掉 → 表现为「卡片消失」。
+// 故在重写智能列之前，识别「当前位于智能列、但上一快照里位于手写列」的卡片，把它移回原手写列，
+// 避免误删。仅在 prevContent 的某手写列里能找到同名片时才移回，避免误伤合法智能卡。
+const PLACEHOLDER_TEXT = "（暂无匹配任务）";
+
+/** 在 prevContent 的「手写列」（非智能列、非归档区）里查找与给定文本相同的卡片，返回所在列名。 */
+function findHandwrittenSourceColumn(
+  content: string,
+  text: string,
+  smartCols: Set<string>,
+  opts: CardTextOpts
+): string | null {
+  const lines = content.split("\n");
+  let cur: string | null = null;
+  for (const line of lines) {
+    const t = line.trim();
+    if (t.startsWith("## ")) {
+      const name = stripSmartSuffix(t.slice(3).trim());
+      cur = name;
+      continue;
+    }
+    if (cur && !smartCols.has(cur) && cur !== ARCHIVE_HEADING) {
+      const cm = /^- \[[ xX]\]\s+(.*)$/.exec(line);
+      if (!cm) continue;
+      if (cardText(cm[1], opts) === text) return cur;
+    }
+  }
+  return null;
+}
+
+/**
+ * 把「被拖进智能列的手写卡」自动移回原手写列（防呆）。
+ * 判定：卡片当前位于某个智能列，且其文本能在 prevContent 的某个手写列里找到
+ * （即它原本是手写卡、被拖入了智能列）。命中则移回原列；未命中（确实不存在于任何手写列）
+ * 则不动，避免误伤合法智能卡（否则合法智能卡会被错误地拽到手写列、再被重写生成而导致重复）。
+ * 必须在 applySmartColumns 之前调用，保证手写卡不被智能列重写清掉。
+ * 返回是否改动了文件与移回数量。
+ */
+export async function revertForeignCardsFromSmartColumns(
+  app: App,
+  file: TFile,
+  prevContent: string | null,
+  defs: SmartColumnDef[],
+  opts: CardTextOpts
+): Promise<{ changed: boolean; moved: number }> {
+  if (defs.length === 0) return { changed: false, moved: 0 };
+  const smartCols = new Set(defs.map((d) => d.column));
+  const content = await app.vault.read(file);
+  const lines = content.split("\n");
+
+  // 收集所有列标题，区分智能列
+  const headings: { idx: number; name: string }[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (t.startsWith("## ")) {
+      headings.push({ idx: i, name: stripSmartSuffix(t.slice(3).trim()) });
+    }
+  }
+
+  // 找出落在智能列、疑似手写来源的卡片（待移回）
+  const foreign: { lineIdx: number; text: string }[] = [];
+  for (const h of headings) {
+    if (!smartCols.has(h.name)) continue;
+    const range = columnRange(lines, h.name);
+    if (range.startIdx === -1) continue;
+    for (let i = range.startIdx + 1; i < range.endIdx; i++) {
+      const cm = /^- \[[ xX]\]\s+(.*)$/.exec(lines[i]);
+      if (!cm) continue;
+      const text = cardText(cm[1], opts);
+      if (text === PLACEHOLDER_TEXT) continue; // 跳过空列占位卡
+      foreign.push({ lineIdx: i, text });
+    }
+  }
+  if (foreign.length === 0) return { changed: false, moved: 0 };
+
+  // 为每张卡确定原手写列（仅在 prevContent 手写列里找到才移回，避免误伤合法智能卡）
+  const moves: { lineIdx: number; targetCol: string | null }[] = [];
+  for (const f of foreign) {
+    const target = prevContent
+      ? findHandwrittenSourceColumn(prevContent, f.text, smartCols, opts)
+      : null;
+    moves.push({ lineIdx: f.lineIdx, targetCol: target });
+  }
+  const realMoves = moves.filter((m) => m.targetCol !== null);
+  if (realMoves.length === 0) {
+    diag(
+      `  [foreign] found=${foreign.length} but none matched a handwritten column in prevContent (skip to avoid hurting legit smart cards)`
+    );
+    return { changed: false, moved: 0 };
+  }
+
+  // 构造新内容：先删原行（倒序），再插到目标列列首
+  const newLines = [...lines];
+  const removeIdxs = [...new Set(realMoves.map((m) => m.lineIdx))].sort(
+    (a, b) => b - a
+  );
+  for (const idx of removeIdxs) newLines.splice(idx, 1);
+
+  let moved = 0;
+  for (const m of realMoves) {
+    const col = m.targetCol as string;
+    let hIdx = -1;
+    for (let i = 0; i < newLines.length; i++) {
+      const tt = newLines[i].trim();
+      if (
+        tt.startsWith("## ") &&
+        stripSmartSuffix(tt.slice(3).trim()) === col
+      ) {
+        hIdx = i;
+        break;
+      }
+    }
+    const cardLine = lines[m.lineIdx]; // 原行文本（lines 未改动，索引仍有效）
+    if (hIdx === -1) {
+      newLines.push(cardLine); // 兜底：列标题没找到（极端），追加到末尾
+    } else {
+      newLines.splice(hIdx + 1, 0, cardLine); // 插到目标列标题之后第一行
+    }
+    moved++;
+  }
+
+  if (moved > 0) {
+    await app.vault.process(file, () => newLines.join("\n"));
+    diag(`  [foreign] moved=${moved} back to handwritten columns`);
+  }
+  return { changed: moved > 0, moved };
 }
 
 // ---------- 列范围 / 循环连续性辅助 ----------

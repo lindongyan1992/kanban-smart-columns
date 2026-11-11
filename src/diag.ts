@@ -26,6 +26,11 @@ export function initDiagAdapter(ad: DataAdapter | null) {
   DIAG_ADAPTER = ad;
 }
 
+/** 查询诊断是否开启——供诊断函数在读文件前先做门控，避免关闭时产生无谓 I/O。 */
+export function isDiagEnabled() {
+  return DIAG_ENABLED;
+}
+
 /** 清空诊断日志文件。 */
 export async function clearDiag() {
   const ad = DIAG_ADAPTER;

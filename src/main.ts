@@ -19,6 +19,9 @@ import {
   autoCompleteInDoneColumn,
   revertMovedFromDone,
   archiveOldDone,
+  revertForeignCardsFromSmartColumns,
+  diagBoardSnapshot,
+  diagColumnDiff,
 } from "./smartColumns";
 import type { CardTextOpts } from "./tasks";
 
@@ -501,6 +504,16 @@ export default class KanbanSmartColumns extends Plugin {
   // 故把整个刷新流程（含视图推送）串行化：同一时刻只有一轮在跑，后续请求排队；
   // 同时 processing 覆盖到推送完成，堵住 modify 事件穿透窗口。
   private refreshQueue: Promise<void> = Promise.resolve();
+  // 方案 2（落盘回读自愈）相关状态：
+  // - lastExpected：每次刷新落盘后「我们期望磁盘保持的内容」，供回读比对。
+  //   放在字段而非闭包，避免并发刷新各自持有过期基准导致误判。
+  // - verifying：同一文件只允许一条监控链在跑，防止多次刷新叠加出多条链互相打架。
+  private lastExpected: Map<string, string> = new Map();
+  private verifying: Set<string> = new Set();
+  // 自愈监控窗口：分 SELF_HEAL_MAX 次回读、间隔约 350ms（覆盖 ≈2s）以捕获 kanban
+  // 的迟到异步回写；窗口内检测到被覆盖就重跑刷新写回，超出窗口仍被覆盖则放弃，
+  // 避免无限回写循环。kanban 一次拖拽的陈旧回写是有界的，≈2s 足以覆盖其安静前窗口。
+  private static readonly SELF_HEAL_MAX = 6;
 
   /**
    * 由设置项构造「卡片保留开关」对象，贯穿建卡 / 回写 / 撤销 / 归档整条链路。
@@ -581,7 +594,7 @@ export default class KanbanSmartColumns extends Plugin {
     }
     if (this.settings.autoRefresh && this.settings.refreshIntervalMinutes > 0) {
       this.timer = window.setInterval(
-        () => this.refreshAll(),
+        () => this.refreshAll(false),
         this.settings.refreshIntervalMinutes * 60 * 1000
       );
     }
@@ -609,12 +622,15 @@ export default class KanbanSmartColumns extends Plugin {
   private async onModify(file: TFile) {
     this.processing = true;
     const prevContent = this.fileSnapshots.get(file.path) ?? null;
+    const opts = this.cardOpts();
     let undoResult: { changed: boolean; revertedSources: TFile[] } = {
       changed: false,
       revertedSources: [],
     };
     try {
-      const opts = this.cardOpts();
+      // 0) 诊断：对比上次快照与磁盘现状的「卡片列归属差异」，须在本轮任何写操作**之前**执行，
+      //    以便捕获「kanban 用拖拽前旧 state 覆盖」或「revertMovedFromDone 内部误伤」的现场。
+      await diagColumnDiff(this.app, file, prevContent, opts);
       // 1) 撤销：把「从完成列拖出」到其它列的卡片还原为未完成（需在其它逻辑前，避免被当作手动勾选回写）
       undoResult = await revertMovedFromDone(
         this.app,
@@ -674,6 +690,9 @@ export default class KanbanSmartColumns extends Plugin {
     if (undoResult.revertedSources.length > 0) {
       await this.refreshAfterUndo(file, undoResult.revertedSources);
     }
+    // 诊断快照：记录最终落盘后各手写列卡片归属（仅 debugMode 写盘），
+    // 用于排查「卡片拖入完成列后又弹回原列」的 kanban 异步保存覆盖竞态。
+    await diagBoardSnapshot(this.app, file, opts);
   }
 
   /**
@@ -700,13 +719,21 @@ export default class KanbanSmartColumns extends Plugin {
    *   用户会看到重复闪烁。日常刷新（modify/拖拽/定时/命令）不清缓存，让 kanban
    *   复用既有 preview，从根上不产生重复。
    */
-  private refreshFile(file: TFile, clearCache = false): Promise<void> {
-    const run = () => this.doRefreshFile(file, clearCache);
+  private refreshFile(
+    file: TFile,
+    clearCache = false,
+    pushView = true
+  ): Promise<void> {
+    const run = () => this.doRefreshFile(file, clearCache, pushView);
     this.refreshQueue = this.refreshQueue.then(run, run);
     return this.refreshQueue;
   }
 
-  private async doRefreshFile(file: TFile, clearCache: boolean) {
+  private async doRefreshFile(
+    file: TFile,
+    clearCache: boolean,
+    pushView = true
+  ) {
     const defs = getSmartColumns(this.app, file);
     if (defs.length === 0) return;
     diag(
@@ -720,6 +747,16 @@ export default class KanbanSmartColumns extends Plugin {
     this.processing = true;
     try {
       const opts = this.cardOpts();
+      // 防呆：把手写列卡片拖进智能列后自动归位，避免被智能列重写清掉（卡片消失）。
+      // 必须在 applySmartColumns 之前调用——此时 this.fileSnapshots 仍是拖拽前快照，
+      // 可据此判断卡片原属哪个手写列。
+      await revertForeignCardsFromSmartColumns(
+        this.app,
+        file,
+        this.fileSnapshots.get(file.path) ?? null,
+        defs,
+        opts
+      );
       await applySmartColumns(
         this.app,
         file,
@@ -732,15 +769,31 @@ export default class KanbanSmartColumns extends Plugin {
       if (this.settings.archiveEnabled) {
         await archiveOldDone(this.app, file, opts);
       }
-      // 记录本次处理后的最终内容，作为下次「拖出撤销」比对的基准
+      // 记录本次处理后的最终内容，作为下次「拖出撤销」比对的基准，
+      // 同时作为方案 2「落盘回读自愈」的期望基准（kanban 异步窗口可能以旧 state 覆盖磁盘）。
       const finalContent = await this.app.vault.read(file);
       this.fileSnapshots.set(file.path, finalContent);
+      this.lastExpected.set(file.path, finalContent);
       // 每次都尝试把磁盘内容推给看板视图（内部会比对 view.data，内容一致时直接跳过）。
       // 注意不能只在本插件「改写了文件」时才同步：磁盘可能早已是正确内容（例如上一次
       // 刷新已写好、或内容本就无需变化），此时 applySmartColumns 不产生改动，
       // 但视图仍可能是陈旧的（kanban 不会自动重读自身文件）——手动刷新就常落在这个分支，
       // 导致「命令刷新了却毫无变化」。故此处无条件调用，交给 syncKanbanView 自行判重。
-      await this.syncKanbanView(file, finalContent, clearCache);
+      // ⚠ 方案 3：pushView=false 时（autoRefresh 定时路径）**不推送视图**，只更新磁盘。
+      // 背景：推送会顺带设置 view.data 并可能触发 kanban 把其（可能陈旧的）内部 state
+      // 序列化回写磁盘，与我们的正确内容对冲，正是「卡片拖入完成列后偶发弹回」的根因之一。
+      // 定时刷新本就不依赖即时视觉反馈，让磁盘保持权威、把视图同步留给下一次用户交互
+      // （modify / file-open 走 pushView=true 路径）即可，从源头砍掉一类对冲窗口。
+      if (pushView) {
+        await this.syncKanbanView(file, finalContent, clearCache);
+      } else {
+        diag(`sync SKIP push (autoRefresh path, pushView=false) ${file.path}`);
+      }
+      // 方案 2：落盘后回读确认（自愈）。kanban 在拖拽后会以拖拽前的旧 state 异步回写磁盘，
+      // 把刚打勾的完成卡覆盖成未勾选、甚至移回原列（「拖入完成列后偶发弹回」根因）。
+      // 落盘后延迟回读，若磁盘已被覆盖（与期望不一致），自动重跑整条刷新链路
+      // （重新派生智能列 + 重新打勾 + 重新推送视图）把正确内容写回，限次重试直至稳定。
+      this.scheduleVerify(file);
     } catch (e) {
       diag(`refreshFile ERROR ${file.path} ${String(e)}`);
       console.error("Smart tasks-kanban: refresh failed", e);
@@ -749,6 +802,76 @@ export default class KanbanSmartColumns extends Plugin {
     }
     diag(`refreshFile END ${file.path}`);
     this.logRenderedCards(file, "afterRefresh");
+  }
+
+  /**
+   * 方案 2：落盘回读自愈的调度入口。在每次刷新落盘后调用一次，启动一条「延迟回读 →
+   * 比对 → 必要时重跑刷新」的监控链。同一文件同一时刻只跑一条链（verifying 去重），
+   * 避免多次刷新叠加出多条互相打架的链。
+   *
+   * 为什么需要它：obsidian-kanban 在拖拽卡片后会**异步**把其内部 state 序列化回写磁盘；
+   * 该 state 可能是拖拽前的旧快照（尚未包含本插件刚打的 ✅ 或刚移动到的完成列）。
+   * 即便本插件已把正确内容写盘并推送视图，kanban 随后的那次回写仍会把它覆盖掉，
+   * 表现为「卡片过一会儿弹回原列、复选框变空」。同步推送无法阻止这次迟到回写，
+   * 只能事后检测并纠正——这正是本方法的定位。
+   *
+   * 监控窗口：分多次回读（SELF_HEAL_MAX 次、间隔约 350ms，覆盖 ≈2s）而非单次，
+   * 因为 kanban 的迟到回写可能发生在我们推盘后数百毫秒甚至更久；单次检测会漏掉。
+   * 窗口内一旦发现被覆盖，立即重跑整条刷新链路把正确内容写回，并继续监控剩余窗口，
+   * 直到内容稳定或窗口耗尽（避免无限回写循环）。窗口耗尽仍被覆盖则放弃并告警。
+   */
+  private scheduleVerify(file: TFile) {
+    if (this.verifying.has(file.path)) return; // 已有监控链在跑，不叠加
+    this.verifying.add(file.path);
+    let check = 0;
+    const step = () => {
+      window.setTimeout(async () => {
+        try {
+          check++;
+          const expected = this.lastExpected.get(file.path);
+          if (expected === undefined) {
+            this.verifying.delete(file.path);
+            return;
+          }
+          const cur = await this.app.vault.read(file);
+          if (!this.contentEqual(cur, expected)) {
+            diag(
+              `selfheal reverted (check ${check}/${KanbanSmartColumns.SELF_HEAL_MAX}) -> re-run refresh+push ${file.path}`
+            );
+            // 重跑整条刷新链路：从来源重新派生智能列、重新给完成列打勾、
+            // 并以 pushView=true 重新推送视图，把被覆盖的正确内容写回。
+            await this.refreshFile(file, false, true);
+            // 重跑后 lastExpected 已更新；继续监控剩余窗口，确认是否还会被覆盖。
+          }
+          if (check >= KanbanSmartColumns.SELF_HEAL_MAX) {
+            const stable = this.contentEqual(
+              (await this.app.vault.read(file)) ?? "",
+              this.lastExpected.get(file.path) ?? ""
+            );
+            diag(
+              `selfheal window ended (checks=${check}) stable=${stable} ${file.path}`
+            );
+            this.verifying.delete(file.path);
+            return;
+          }
+          step();
+        } catch (e) {
+          diag(`selfheal ERROR ${file.path} ${String(e)}`);
+          this.verifying.delete(file.path);
+        }
+      }, 350);
+    };
+    step();
+  }
+
+  /**
+   * 归一化比对两段看板文本：Obsidian 写盘/读盘可能在换行符或末尾换行上有细微差异，
+   * 直接全等比对会产生「假阳性回退」。归一化到 LF + 去掉末尾换行后再比，
+   * 仍能准确识别 kanban 把卡片移列/去勾这类实质性覆盖（内容会真正变化）。
+   */
+  private contentEqual(a: string, b: string): boolean {
+    const norm = (s: string) => s.replace(/\r\n/g, "\n").replace(/\n+$/, "");
+    return norm(a) === norm(b);
   }
 
   /**
@@ -881,6 +1004,37 @@ export default class KanbanSmartColumns extends Plugin {
     } catch (e) {
       diag(`  boardToMd check THREW ${String(e)}`);
     }
+    // ⚠ 检测「本次刷新把一张已勾选的卡片从看板移除」——典型场景：在智能列（如逾期）
+    // 勾选卡片 → 来源标记完成后该卡片被智能列过滤掉；或把完成列卡片拖回其它列被翻回未完成。
+    // 这类「勾选态卡片消失」会让 kanban 把该卡**原位置**的「已完成日期徽章」错位复用到
+    // 上移后占据该位置的卡片上（与「文本重复」同源：lane 结构变化后组件/位置被复用、旧状态未清），
+    // 表现为「被点卡片消失、下一张卡片顶着错误的完成日期」。此时必须**强制清缓存 + forceRefresh**
+    // 让 kanban 用新 state 干净重建，否则错位徽章会残留。正常的清缓存顾虑（文本短暂叠加）由
+    // 下方 dedupePreviewDOM / MutationObserver 兜底擦除，故此处可安全升级为清缓存。
+    let forceClearCache = false;
+    try {
+      const sm0 = this.kanbanStateManager(file);
+      const parser0 = sm0?.parser as
+        | { boardToMd?: (st: unknown) => string }
+        | undefined;
+      if (
+        parser0 &&
+        typeof parser0.boardToMd === "function" &&
+        sm0?.state
+      ) {
+        const viewMd0 = parser0.boardToMd(sm0.state);
+        const viewChecked = (viewMd0.match(/^- \[[xX]\]/gm) || []).length;
+        const contentChecked = (content.match(/^- \[[xX]\]/gm) || []).length;
+        if (viewChecked > contentChecked) {
+          forceClearCache = true;
+          diag(
+            `  forceClearCache: checked card removed by this refresh (view=${viewChecked} content=${contentChecked})`
+          );
+        }
+      }
+    } catch (e) {
+      diag(`  forceClearCache check THREW ${String(e)}`);
+    }
     let leaves: WorkspaceLeaf[] = [];
     try {
       leaves = this.app.workspace.getLeavesOfType(KANBAN_VIEW_TYPE);
@@ -922,7 +1076,7 @@ export default class KanbanSmartColumns extends Plugin {
       // 干净渲染才自愈——正是用户看到的「拖拽后下方卡片短暂重复」。
       // 故：日常刷新（modify/拖拽/定时/命令）一律不清缓存，让 kanban 复用既有
       // preview，从根上不产生重复；只有设置变更才清，确保显示类开关立即生效。
-      if (clearCache) {
+      if (clearCache || forceClearCache) {
         this.clearKanbanCardCache(view);
       }
 
@@ -945,7 +1099,7 @@ export default class KanbanSmartColumns extends Plugin {
           // 重复。不清缓存时，newBoard 内部的 setState + validatePreviewCache 已足够让
           // kanban 按新 state 更新卡片，无需再叠加一次强制重画。
           if (typeof sm.forceRefresh === "function") {
-            if (clearCache) {
+            if (clearCache || forceClearCache) {
               try {
                 sm.forceRefresh();
                 diag("  forceRefresh OK");
@@ -983,7 +1137,7 @@ export default class KanbanSmartColumns extends Plugin {
       // 回退路径：第二个参数 clear 只在设置变更时为 true（= 清空渲染缓存）；
       // 日常刷新传 false，复用既有 preview，避免新旧叠加产生重复。
       try {
-        view.setViewData?.(content, clearCache);
+        view.setViewData?.(content, clearCache || forceClearCache);
         view.data = content;
         this.lastPushed.set(file.path, content);
         diag(`  setViewData(clear=${clearCache}) OK (fallback)`);
@@ -1312,7 +1466,7 @@ private logKanbanState(
     if (file instanceof TFile) await this.refreshFile(file);
   }
 
-  private async refreshAll() {
+  private async refreshAll(pushView = true) {
     // 不再因 processing 直接 return：刷新已串行排队，重入只会把任务追加到队列尾部
     // （幂等、lastPushed 判重后多为空跑），丢弃反而会漏刷。旧的重入闸门是
     // 「processing 为真时 refreshAll 与 refreshFile 并发会交错渲染」时代的防重入手段，
@@ -1320,7 +1474,9 @@ private logKanbanState(
     const files = this.app.vault.getMarkdownFiles();
     for (const file of files) {
       if (isKanbanFile(this.app, file)) {
-        await this.refreshFile(file);
+        // ⚠ 方案 3：autoRefresh 定时路径（pushView=false）只更新磁盘、不推视图，
+        // 避免推送顺带 set view.data 触发 kanban 把陈旧 state 序列化回写、与正确内容对冲。
+        await this.refreshFile(file, false, pushView);
       }
     }
   }
